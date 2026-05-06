@@ -492,7 +492,6 @@ export default function (pi: ExtensionAPI) {
       max_chars: Type.Optional(
         Type.Number({ description: `Hard truncate (défaut ${HARD_TRUNCATE})`, default: HARD_TRUNCATE }),
       ),
-      no_cache: Type.Optional(Type.Boolean({ description: "Ignore le cache disque", default: false })),
     }),
     async execute(_id, params, signal, _onUpdate, _ctx): Promise<ToolResult> {
       try {
@@ -507,8 +506,11 @@ export default function (pi: ExtensionAPI) {
             ? params.prompt
             : undefined;
 
-        // 1. Cache hit (uniquement si pas de summary à faire — sinon il faudrait re-summarize)
-        if (!params.no_cache && !promptText) {
+        // 1. Cache hit (uniquement si pas de summary à faire — sinon il faudrait re-summarize).
+        // Pas de bypass exposé au LLM : si tu veux forcer un re-summarize, passe juste
+        // un `prompt` (la branche cache hit ne couvre que le cas no-prompt). Le TTL
+        // 24h gère le rafraîchissement automatique pour les pages qui changent.
+        if (!promptText) {
           const hit = readCache(url);
           if (hit) {
             const truncated = hit.content.length > max_chars;
