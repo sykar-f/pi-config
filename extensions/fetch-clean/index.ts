@@ -441,7 +441,7 @@ export default function (pi: ExtensionAPI) {
       ),
       no_cache: Type.Optional(Type.Boolean({ description: "Ignore le cache disque", default: false })),
     }),
-    async execute(_id, params, signal, onUpdate, _ctx): Promise<ToolResult> {
+    async execute(_id, params, signal, _onUpdate, _ctx): Promise<ToolResult> {
       try {
         if (!isValidUrl(params?.url)) {
           return errorResult(`URL invalide: ${String(params?.url)}`, { url: String(params?.url ?? "") });
@@ -454,11 +454,6 @@ export default function (pi: ExtensionAPI) {
         if (!params.no_cache && !promptText) {
           const hit = readCache(url);
           if (hit) {
-            try {
-              onUpdate?.({ status: "cache-hit" });
-            } catch {
-              // ignore onUpdate errors
-            }
             const truncated = hit.content.length > max_chars;
             const out = truncated
               ? hit.content.slice(0, max_chars) + `\n\n[truncated. use get_stored_content to read more]`
@@ -468,11 +463,6 @@ export default function (pi: ExtensionAPI) {
         }
 
         // 2. Fetch + extract
-        try {
-          onUpdate?.({ status: "fetching" });
-        } catch {
-          // ignore
-        }
         let routed: RoutedFetch;
         try {
           routed = await routedFetch(url, signal);
@@ -490,11 +480,6 @@ export default function (pi: ExtensionAPI) {
 
         // 3. Summarize via Qwen si prompt fourni
         if (promptText && content.length > 500) {
-          try {
-            onUpdate?.({ status: "summarizing" });
-          } catch {
-            // ignore
-          }
           try {
             const summary = await summarizeWithQwen(content, promptText, signal);
             if (summary && summary.trim().length > 0) {
