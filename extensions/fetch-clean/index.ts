@@ -1,23 +1,23 @@
 // fetch-clean — extension Pi pour accès web token-efficient.
 //
-// Trois tools exposés au LLM :
-//   - web_search       : recherche via SearXNG self-hosted (homelab)
-//   - fetch_clean      : fetch URL + defuddle extraction + Jina fallback + summary Qwen optionnel
-//   - get_stored_content : retrouve un fetch précédent depuis le cache (par url ou last)
+// Deux tools exposés au LLM :
+//   - web_search  : discovery via SearXNG self-hosted (homelab) — cheap, retourne juste
+//                   titre/URL/snippet pour 5-10 résultats
+//   - fetch_clean : fetch URL → markdown propre (defuddle), fallback Jina Reader
+//                   self-hosted si bloqué, summary Qwen optionnel via `prompt`
+//
+// Pas de cache : chaque fetch_clean est toujours frais (la latence pure sans summary
+// est ~1-3s direct, ~5-15s via Jina). Si le LLM a besoin de relire un fetch précédent,
+// il doit le re-appeler. Trade-off conscient pour garantir la fraîcheur (pages CI,
+// docs versionnées, releases qui changent) et simplifier l'API.
 //
 // Garanties de robustesse :
 //   - chaque execute() est wrappé dans un try/catch global → jamais de throw au runtime Pi
-//   - safeResult() garantit la shape { content: [...], details } attendue par Pi
-//   - sémaphore Qwen (3 concurrent max) → évite saturation SGLang sous fetch parallèles
-//   - timeout par phase (fetch direct, Jina, summarize)
-//   - validation params défensive (URL parsable, types corrects)
-//
-// Cache disque : ~/.pi/cache/web/<sha1(url)>.md (TTL 24h, LRU 500MB)
+//   - safeResult()/errorResult() garantissent la shape { content: [...], details } attendue
+//   - sémaphore Qwen (3 concurrent max) → évite saturation SGLang sous fetches parallèles
+//   - timeout par phase (fetch direct 15s, Jina 45s, summarize 60s, SearXNG 15s)
+//   - validation params défensive (URL parsable, types corrects, bornes sur nombres)
 
-import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, unlinkSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
-import { join } from "node:path";
-import { createHash } from "node:crypto";
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { Type } from "typebox";
 import { Defuddle } from "defuddle/node";
@@ -28,9 +28,6 @@ import TurndownService from "turndown";
 // Configuration
 // ─────────────────────────────────────────────────────────────────────────────
 
-const CACHE_DIR = process.env.PI_FETCH_CACHE_DIR || join(homedir(), ".pi", "cache", "web");
-const CACHE_TTL_MS = 24 * 60 * 60 * 1000;
-const CACHE_MAX_BYTES = 500 * 1024 * 1024;
 const HARD_TRUNCATE = 30_000;
 
 const SEARXNG_URL = process.env.PI_SEARXNG_URL || "http://docker:8888";
@@ -46,6 +43,11 @@ const SEARXNG_TIMEOUT_MS = 15_000;
 // pour notre setup (2× RTX 4090, batch limité). Sémaphore défensif.
 const QWEN_MAX_CONCURRENT = 3;
 
+const SUMMARY_MAX_TOKENS_DEFAULT = 1024;
+// Cap dur pour éviter les abus / latence excessive. Au-delà, mieux vaut splitter
+// la page en plusieurs fetch_clean ciblés avec des prompts différents.
+const SUMMARY_MAX_TOKENS_HARD_CAP = 8192;
+
 const UA =
   "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36";
 
@@ -60,7 +62,6 @@ type ToolResult = {
 };
 
 function safeResult(text: string, details: Record<string, unknown> = {}, isError = false): ToolResult {
-  // Pi attend strictement un tableau content non-vide. Coerce text en string.
   const safeText = typeof text === "string" && text.length > 0 ? text : "[empty result]";
   return {
     content: [{ type: "text", text: safeText }],
@@ -120,96 +121,6 @@ function withTimeout(parent: AbortSignal | undefined, ms: number): { signal: Abo
       if (parent) parent.removeEventListener("abort", onParentAbort);
     },
   };
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Cache helpers
-// ─────────────────────────────────────────────────────────────────────────────
-
-function ensureCacheDir(): void {
-  try {
-    if (!existsSync(CACHE_DIR)) mkdirSync(CACHE_DIR, { recursive: true });
-  } catch {
-    // ignore — cache best-effort
-  }
-}
-
-function urlKey(url: string): string {
-  return createHash("sha1").update(url).digest("hex");
-}
-
-function cachePath(url: string): string {
-  return join(CACHE_DIR, `${urlKey(url)}.md`);
-}
-
-function metaPath(url: string): string {
-  return join(CACHE_DIR, `${urlKey(url)}.json`);
-}
-
-function lastPath(): string {
-  return join(CACHE_DIR, "_last.json");
-}
-
-interface CacheMeta {
-  url: string;
-  title?: string;
-  fetched_at: number;
-  length: number;
-  source: "direct" | "jina";
-  summarized: boolean;
-}
-
-function writeCache(url: string, content: string, meta: CacheMeta): void {
-  try {
-    ensureCacheDir();
-    writeFileSync(cachePath(url), content);
-    writeFileSync(metaPath(url), JSON.stringify(meta, null, 2));
-    writeFileSync(lastPath(), JSON.stringify({ url }));
-    evictLRU();
-  } catch {
-    // cache write failure ne doit pas bloquer le tool
-  }
-}
-
-function readCache(url: string): { content: string; meta: CacheMeta } | null {
-  try {
-    const cp = cachePath(url);
-    const mp = metaPath(url);
-    if (!existsSync(cp) || !existsSync(mp)) return null;
-    const meta = JSON.parse(readFileSync(mp, "utf8")) as CacheMeta;
-    if (Date.now() - meta.fetched_at > CACHE_TTL_MS) return null;
-    const content = readFileSync(cp, "utf8");
-    return { content, meta };
-  } catch {
-    return null;
-  }
-}
-
-function evictLRU(): void {
-  try {
-    const entries = readdirSync(CACHE_DIR)
-      .filter((f) => f.endsWith(".md"))
-      .map((f) => {
-        const fp = join(CACHE_DIR, f);
-        const s = statSync(fp);
-        return { fp, mtime: s.mtimeMs, size: s.size };
-      })
-      .sort((a, b) => a.mtime - b.mtime);
-    let total = entries.reduce((s, e) => s + e.size, 0);
-    for (const e of entries) {
-      if (total <= CACHE_MAX_BYTES) break;
-      try {
-        unlinkSync(e.fp);
-        const json = e.fp.replace(/\.md$/, ".json");
-        if (existsSync(json)) unlinkSync(json);
-        total -= e.size;
-      } catch {
-        // ignore
-      }
-    }
-  } catch {
-    // ignore eviction errors
-  }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -280,16 +191,15 @@ async function extractWithDefuddle(html: string, url: string): Promise<{ markdow
   return { markdown: md, title: result.title };
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Summary Qwen
+// ─────────────────────────────────────────────────────────────────────────────
+
 interface SummaryResult {
   text: string;
   truncatedByLength: boolean;
   finishReason: string | null;
 }
-
-const SUMMARY_MAX_TOKENS_DEFAULT = 1024;
-// Cap dur pour éviter les abus / latence excessive. Au-delà, mieux vaut splitter
-// la page en plusieurs fetch_clean ciblés.
-const SUMMARY_MAX_TOKENS_HARD_CAP = 8192;
 
 async function summarizeWithQwen(
   markdown: string,
@@ -301,9 +211,9 @@ async function summarizeWithQwen(
   const { signal, cancel } = withTimeout(parentSignal, QWEN_SUMMARIZE_TIMEOUT_MS);
   try {
     const tokenBudget = Math.min(Math.max(128, maxTokens), SUMMARY_MAX_TOKENS_HARD_CAP);
-    // Le hint dans le prompt système vise ~80% du budget pour laisser une marge
-    // au modèle de finir proprement sa dernière phrase.
-    const targetWords = Math.floor((tokenBudget * 0.8) / 1.3); // ~1.3 tokens/mot français
+    // Hint dans le prompt système : ~80% du budget pour laisser une marge au modèle
+    // de finir proprement sa dernière phrase. ~1.3 tokens/mot français.
+    const targetWords = Math.floor((tokenBudget * 0.8) / 1.3);
     const sysPrompt = `Tu extrais ou résumes du contenu web pour un agent.
 Instruction: ${prompt}
 Tu reçois le markdown nettoyé d'une page.
@@ -397,22 +307,21 @@ async function routedFetch(url: string, signal: AbortSignal | undefined): Promis
 // ─────────────────────────────────────────────────────────────────────────────
 
 export default function (pi: ExtensionAPI) {
-  ensureCacheDir();
-
   // ── web_search ─────────────────────────────────────────────────────────────
   pi.registerTool({
     name: "web_search",
     label: "Web Search",
     description:
-      "Recherche web via SearXNG (homelab). Retourne 5-10 résultats: titre, snippet, URL. Discovery cheap, puis fetch_clean pour le contenu.",
-    promptSnippet: "Recherche web via SearXNG → titres, snippets, URLs.",
+      "Recherche web via SearXNG self-hosted (homelab). Étape de **discovery cheap** : retourne 5-10 résultats (titre + URL + snippet ~200 chars), sans charger le contenu des pages. Coût ~1s, ~1000 tokens output. Workflow typique : web_search d'abord pour trouver les URLs pertinentes, puis fetch_clean(url, prompt) pour zoomer sur le contenu utile.",
+    promptSnippet: "Discovery web : 5-10 résultats {titre, URL, snippet}. Cheap, à enchaîner avec fetch_clean.",
     promptGuidelines: [
-      "Use web_search before fetch_clean when you don't already have a URL.",
-      "web_search returns only metadata (title/snippet/URL) — no full page content.",
+      "Use web_search before fetch_clean when you don't already have an exact URL.",
+      "web_search returns only metadata (title/snippet/URL) — never full page content. Always pair with fetch_clean for actual content.",
+      "Pick at most 1-3 URLs from web_search results that look most relevant — don't fetch_clean all 8.",
     ],
     parameters: Type.Object({
-      query: Type.String({ description: "Requête de recherche" }),
-      limit: Type.Optional(Type.Number({ description: "Nombre max de résultats (défaut 8)", default: 8 })),
+      query: Type.String({ description: "Requête de recherche en langage naturel (ex: 'kubernetes operator best practices 2026')" }),
+      limit: Type.Optional(Type.Number({ description: "Nombre max de résultats (défaut 8, cap 20)", default: 8 })),
     }),
     async execute(_id, params, signal, _onUpdate, _ctx): Promise<ToolResult> {
       try {
@@ -460,37 +369,42 @@ export default function (pi: ExtensionAPI) {
     name: "fetch_clean",
     label: "Fetch Clean",
     description:
-      "Fetch URL → markdown propre (defuddle), fallback Jina Reader si bloqué. Si `prompt` fourni, Qwen extrait/résume seulement ce qui matche. Toujours préférer ce tool à curl pour récupérer du contenu web.",
-    promptSnippet: "Fetch URL → markdown clean. Avec `prompt`, summarize/extract via Qwen.",
+      "Récupère et nettoie le contenu d'une URL web. Toujours préférer ce tool à curl/wget. Pipeline : (1) HTTP direct + extraction defuddle (strip nav/sidebar/footer/ads) → markdown propre ; (2) si bloqué/JS-only, fallback Jina Reader self-hosted (rend la page côté serveur) ; (3) si `prompt` fourni, Qwen extrait/résume seulement la partie qui répond à ton instruction. **Pas de cache, chaque appel est frais.** Cas typique : `fetch_clean(url, prompt='quelle est la version actuelle ?')` → ~500 tokens au lieu de 50k de markdown brut.",
+    promptSnippet: "URL → markdown propre. Avec `prompt`, summarize/extract via Qwen (économise 10-100x les tokens).",
     promptGuidelines: [
-      "Use fetch_clean instead of curl/wget for any web URL — strips noise and handles bot detection.",
-      "Pass a `prompt` to fetch_clean whenever possible: it summarizes via Qwen and saves tokens.",
-      "fetch_clean caches results 24h — re-calling the same URL is cheap.",
-      "Set `raw: true` when you need verbatim content (code extraction, exact citations, debugging) — skips the Qwen summary even if `prompt` is given.",
-      "If a summary comes back marked [TRUNCATED] (finish_reason=length), re-call with a larger `summary_max_tokens` (default 1024, hard cap 8192).",
+      "Use fetch_clean instead of curl/wget for any web URL — strips noise (nav/ads/footer) and handles bot detection automatically via Jina fallback.",
+      "**Always pass a `prompt` when you have a specific question** — Qwen will summarize/extract only what matches, returning ~500-1500 tokens instead of 30k of raw markdown. Example: fetch_clean(url, prompt='donne le numéro de version actuel').",
+      "Skip `prompt` only when you genuinely need the full markdown of the page (rare — usually means you need raw, see below).",
+      "Set `raw: true` for verbatim content (extracting code snippets, citing exact phrases, debugging extraction). This skips Qwen even if `prompt` is given.",
+      "If a summary comes back marked `[TRUNCATED]` (finish_reason=length), re-call fetch_clean with a larger `summary_max_tokens` (default 1024, cap 8192). Typical bumps: 2048 for detailed lists, 4096 for multi-section synthesis.",
+      "Each fetch_clean call is fresh (no cache). Don't re-call with the same URL+prompt expecting different results.",
     ],
     parameters: Type.Object({
       url: Type.String({ description: "URL absolue à fetcher (http/https)" }),
       prompt: Type.Optional(
         Type.String({
-          description: "Instruction d'extraction/résumé. Si fourni (et `raw` non activé), Qwen filtre le contenu pour ne garder que ce qui matche.",
+          description:
+            "Instruction d'extraction/résumé pour Qwen. Si fourni (et `raw` non activé), Qwen filtre la page pour ne garder que ce qui répond à ton instruction. Économise 10-100x les tokens vs raw markdown. Exemples : 'donne juste la version', 'résume en 3 bullets', 'liste les endpoints POST'.",
         }),
       ),
       raw: Type.Optional(
         Type.Boolean({
           description:
-            "Force le retour du markdown brut, même si `prompt` est fourni. Utile pour extraction littérale (code, citations exactes, debugging).",
+            "Force le retour markdown brut, même si `prompt` est fourni. Utile pour : extraction code source littérale, citation exacte avec ponctuation/casse, debug d'extraction. Coûteux en tokens — n'utilise que si vraiment nécessaire.",
           default: false,
         }),
       ),
       summary_max_tokens: Type.Optional(
         Type.Number({
-          description: `Budget tokens du summary Qwen (défaut ${SUMMARY_MAX_TOKENS_DEFAULT}, cap dur ${SUMMARY_MAX_TOKENS_HARD_CAP}). Augmente si le summary précédent est tronqué (finish_reason=length).`,
+          description: `Budget tokens du summary Qwen (défaut ${SUMMARY_MAX_TOKENS_DEFAULT}, cap ${SUMMARY_MAX_TOKENS_HARD_CAP}). Augmente si le summary précédent revient préfixé [TRUNCATED] (finish_reason=length).`,
           default: SUMMARY_MAX_TOKENS_DEFAULT,
         }),
       ),
       max_chars: Type.Optional(
-        Type.Number({ description: `Hard truncate (défaut ${HARD_TRUNCATE})`, default: HARD_TRUNCATE }),
+        Type.Number({
+          description: `Hard truncate du markdown brut (défaut ${HARD_TRUNCATE} chars). Sans effet sur le summary qui est toujours plus court.`,
+          default: HARD_TRUNCATE,
+        }),
       ),
     }),
     async execute(_id, params, signal, _onUpdate, _ctx): Promise<ToolResult> {
@@ -506,22 +420,7 @@ export default function (pi: ExtensionAPI) {
             ? params.prompt
             : undefined;
 
-        // 1. Cache hit (uniquement si pas de summary à faire — sinon il faudrait re-summarize).
-        // Pas de bypass exposé au LLM : si tu veux forcer un re-summarize, passe juste
-        // un `prompt` (la branche cache hit ne couvre que le cas no-prompt). Le TTL
-        // 24h gère le rafraîchissement automatique pour les pages qui changent.
-        if (!promptText) {
-          const hit = readCache(url);
-          if (hit) {
-            const truncated = hit.content.length > max_chars;
-            const out = truncated
-              ? hit.content.slice(0, max_chars) + `\n\n[truncated. use get_stored_content to read more]`
-              : hit.content;
-            return safeResult(`# ${hit.meta.title || url}\n\n${out}`, { ...hit.meta, cached: true, truncated });
-          }
-        }
-
-        // 2. Fetch + extract
+        // 1. Fetch + extract (toujours frais)
         let routed: RoutedFetch;
         try {
           routed = await routedFetch(url, signal);
@@ -543,7 +442,7 @@ export default function (pi: ExtensionAPI) {
           SUMMARY_MAX_TOKENS_HARD_CAP,
         );
 
-        // 3. Summarize via Qwen si prompt fourni
+        // 2. Summarize via Qwen si prompt fourni
         if (promptText && content.length > 500) {
           try {
             const summary = await summarizeWithQwen(content, promptText, signal, summaryBudget);
@@ -559,18 +458,7 @@ export default function (pi: ExtensionAPI) {
           }
         }
 
-        // 4. Stocke en cache (toujours le markdown brut, pas le summary)
-        const meta: CacheMeta = {
-          url,
-          title: routed.title,
-          fetched_at: Date.now(),
-          length: routed.markdown.length,
-          source: routed.source,
-          summarized,
-        };
-        writeCache(url, routed.markdown, meta);
-
-        // 5. Préfixe explicite si le summary a été coupé par la limite de tokens
+        // 3. Préfixe explicite si le summary a été coupé par la limite de tokens
         // → le LLM parent peut décider de re-appeler avec summary_max_tokens plus élevé.
         let displayContent = content;
         if (summaryTruncatedByLength) {
@@ -580,14 +468,18 @@ export default function (pi: ExtensionAPI) {
             content;
         }
 
-        // 6. Hard truncate output
+        // 4. Hard truncate output (sécurité)
         const truncated = displayContent.length > max_chars;
         const finalText = truncated
-          ? displayContent.slice(0, max_chars) + `\n\n[truncated at ${max_chars} chars. use get_stored_content for more]`
+          ? displayContent.slice(0, max_chars) + `\n\n[truncated at ${max_chars} chars — augmente max_chars ou utilise un prompt plus ciblé]`
           : displayContent;
 
         return safeResult(`# ${routed.title || url}\n\n${finalText}`, {
-          ...meta,
+          url,
+          title: routed.title,
+          source: routed.source,
+          length: routed.markdown.length,
+          summarized,
           truncated,
           summary_max_tokens: summarized ? summaryBudget : undefined,
           summary_truncated_by_length: summarized ? summaryTruncatedByLength : undefined,
@@ -597,62 +489,6 @@ export default function (pi: ExtensionAPI) {
         // Fallback ultime — ne jamais throw au runtime Pi
         const msg = e instanceof Error ? e.message : String(e);
         return errorResult(`fetch_clean exception: ${msg}`, { url: String(params?.url ?? "") });
-      }
-    },
-  });
-
-  // ── get_stored_content ─────────────────────────────────────────────────────
-  pi.registerTool({
-    name: "get_stored_content",
-    label: "Get Stored Content",
-    description:
-      "Récupère un fetch_clean précédent depuis le cache disque, par URL ou via `last: true`. Permet de relire des passages sans repayer fetch.",
-    promptSnippet: "Lit un fetch_clean précédent depuis le cache. Utile pour zoom sur passage précis.",
-    promptGuidelines: [
-      "Use get_stored_content to re-read a previously fetched URL without paying the fetch cost again.",
-      "get_stored_content supports {last: true} when the original URL is hard to recall.",
-    ],
-    parameters: Type.Object({
-      url: Type.Optional(Type.String({ description: "URL exacte précédemment fetchée" })),
-      last: Type.Optional(Type.Boolean({ description: "Récupère le dernier fetch de la session", default: false })),
-      line_start: Type.Optional(Type.Number({ description: "Ligne de début (1-indexed)" })),
-      line_end: Type.Optional(Type.Number({ description: "Ligne de fin inclusive" })),
-      max_chars: Type.Optional(Type.Number({ description: "Limite chars retournés", default: HARD_TRUNCATE })),
-    }),
-    async execute(_id, params, _signal, _onUpdate, _ctx): Promise<ToolResult> {
-      try {
-        let url = typeof params?.url === "string" && params.url.length > 0 ? params.url : undefined;
-        if (!url && params?.last) {
-          try {
-            const lp = lastPath();
-            if (existsSync(lp)) {
-              url = (JSON.parse(readFileSync(lp, "utf8")) as { url?: string }).url;
-            }
-          } catch {
-            // ignore
-          }
-        }
-        if (!url) {
-          return errorResult("Aucune URL fournie et pas de fetch précédent.");
-        }
-        const hit = readCache(url);
-        if (!hit) {
-          return errorResult(`Pas de cache pour ${url}. Utilise fetch_clean d'abord.`, { url });
-        }
-        let content = hit.content;
-        if (params.line_start || params.line_end) {
-          const lines = content.split("\n");
-          const start = Math.max(0, (params.line_start ?? 1) - 1);
-          const end = params.line_end ? Math.min(lines.length, params.line_end) : lines.length;
-          content = lines.slice(start, end).join("\n");
-        }
-        const max_chars = Math.max(500, params.max_chars ?? HARD_TRUNCATE);
-        const truncated = content.length > max_chars;
-        const out = truncated ? content.slice(0, max_chars) + `\n\n[truncated at ${max_chars} chars]` : content;
-        return safeResult(out, { ...hit.meta, truncated, total_length: hit.content.length });
-      } catch (e) {
-        const msg = e instanceof Error ? e.message : String(e);
-        return errorResult(`get_stored_content exception: ${msg}`, { url: String(params?.url ?? "") });
       }
     },
   });
