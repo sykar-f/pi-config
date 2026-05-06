@@ -1,0 +1,12 @@
+{
+  "name": "pi-fetch-clean",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Pi extension: fetch_clean + web_search + get_stored_content. Token-efficient web access via SearXNG + Jina Reader self-hosted.",
+  "type": "module",
+  "dependencies": {
+    "defuddle": "^0.18.1",
+    "jsdom": "^25.0.1",
+    "turndown": "^7.2.0"
+  }
+}
