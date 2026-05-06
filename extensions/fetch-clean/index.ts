@@ -304,11 +304,19 @@ Maximum 800 tokens.`;
         max_tokens: 1024,
         temperature: 0.3,
         stream: false,
+        // Désactive le thinking mode pour Qwen3 — résumer ne nécessite pas de
+        // raisonnement et thinking volait tout le budget max_tokens (content=null).
+        chat_template_kwargs: { enable_thinking: false },
       }),
     });
     if (!res.ok) throw new Error(`Qwen summarize HTTP ${res.status}`);
-    const data = (await res.json()) as { choices?: Array<{ message?: { content?: string } }> };
-    return data.choices?.[0]?.message?.content || "";
+    const data = (await res.json()) as {
+      choices?: Array<{ message?: { content?: string | null; reasoning_content?: string | null } }>;
+    };
+    const msg = data.choices?.[0]?.message;
+    // Fallback ceinture+bretelles : si content null malgré chat_template_kwargs
+    // (vieux serveurs SGLang, modèles non-Qwen3), on récupère reasoning_content.
+    return msg?.content || msg?.reasoning_content || "";
   } finally {
     cancel();
     release();
@@ -428,12 +436,20 @@ export default function (pi: ExtensionAPI) {
       "Use fetch_clean instead of curl/wget for any web URL — strips noise and handles bot detection.",
       "Pass a `prompt` to fetch_clean whenever possible: it summarizes via Qwen and saves tokens.",
       "fetch_clean caches results 24h — re-calling the same URL is cheap.",
+      "Set `raw: true` when you need verbatim content (code extraction, exact citations, debugging) — skips the Qwen summary even if `prompt` is given.",
     ],
     parameters: Type.Object({
       url: Type.String({ description: "URL absolue à fetcher (http/https)" }),
       prompt: Type.Optional(
         Type.String({
-          description: "Instruction d'extraction/résumé. Si fourni, Qwen filtre le contenu pour ne garder que ce qui matche.",
+          description: "Instruction d'extraction/résumé. Si fourni (et `raw` non activé), Qwen filtre le contenu pour ne garder que ce qui matche.",
+        }),
+      ),
+      raw: Type.Optional(
+        Type.Boolean({
+          description:
+            "Force le retour du markdown brut, même si `prompt` est fourni. Utile pour extraction littérale (code, citations exactes, debugging).",
+          default: false,
         }),
       ),
       max_chars: Type.Optional(
@@ -448,9 +464,13 @@ export default function (pi: ExtensionAPI) {
         }
         const url = params.url;
         const max_chars = Math.max(500, params.max_chars ?? HARD_TRUNCATE);
-        const promptText = typeof params.prompt === "string" && params.prompt.trim().length > 0 ? params.prompt : undefined;
+        const rawMode = params.raw === true;
+        const promptText =
+          !rawMode && typeof params.prompt === "string" && params.prompt.trim().length > 0
+            ? params.prompt
+            : undefined;
 
-        // 1. Cache hit (uniquement si pas de prompt — sinon il faudrait re-summarize)
+        // 1. Cache hit (uniquement si pas de summary à faire — sinon il faudrait re-summarize)
         if (!params.no_cache && !promptText) {
           const hit = readCache(url);
           if (hit) {
