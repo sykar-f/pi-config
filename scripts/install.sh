@@ -26,8 +26,11 @@ npm install --silent
 echo "==> symlink fetch-clean"
 ln -sfn "$REPO_DIR/extensions/fetch-clean" "$PI_HOME/extensions/fetch-clean"
 
-echo "==> symlink pi-subagents"
-ln -sfn "$REPO_DIR/extensions/_packages/node_modules/@tintinweb/pi-subagents" "$PI_HOME/extensions/pi-subagents"
+echo "==> symlink rtk-bash"
+ln -sfn "$REPO_DIR/extensions/rtk-bash" "$PI_HOME/extensions/rtk-bash"
+
+echo "==> symlink pi-subagents (vers le sous-répertoire src/ du package npm)"
+ln -sfn "$REPO_DIR/extensions/_packages/node_modules/@tintinweb/pi-subagents/src" "$PI_HOME/extensions/pi-subagents"
 
 # 4. Symlinks agents
 echo "==> symlink agents"
