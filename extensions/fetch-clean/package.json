@@ -7,6 +7,7 @@
   "dependencies": {
     "defuddle": "^0.18.1",
     "jsdom": "^25.0.1",
-    "turndown": "^7.2.0"
+    "turndown": "^7.2.0",
+    "undici": "^7.0.0"
   }
 }

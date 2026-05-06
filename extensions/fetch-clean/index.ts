@@ -23,6 +23,19 @@ import { Type } from "typebox";
 import { Defuddle } from "defuddle/node";
 import { JSDOM } from "jsdom";
 import TurndownService from "turndown";
+import { Agent, setGlobalDispatcher } from "undici";
+
+// Pool HTTP keep-alive partagé : évite les handshakes TLS répétés sur fetches
+// parallèles vers le même domaine (Wikipedia, GitHub, etc.). Gain ~150-300ms
+// par fetch après le premier sur un même host.
+setGlobalDispatcher(
+  new Agent({
+    keepAliveTimeout: 30_000,
+    keepAliveMaxTimeout: 60_000,
+    connections: 32, // pool large : permet jusqu'à 32 connexions simultanées
+    pipelining: 1,
+  }),
+);
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Configuration
@@ -181,12 +194,18 @@ async function fetchViaJina(url: string, parentSignal: AbortSignal | undefined):
 const turndown = new TurndownService({ headingStyle: "atx", codeBlockStyle: "fenced", bulletListMarker: "-" });
 turndown.remove(["script", "style", "noscript", "iframe"]);
 
+// Yield à l'event loop pour permettre aux autres fetches parallèles de progresser
+// pendant que JSDOM/Defuddle/turndown (synchrones, CPU-bound) traitent un gros HTML.
+const yieldToEventLoop = () => new Promise<void>((resolve) => setImmediate(resolve));
+
 async function extractWithDefuddle(html: string, url: string): Promise<{ markdown: string; title?: string }> {
   const dom = new JSDOM(html, { url });
+  await yieldToEventLoop();
   const result = (await new Defuddle(dom, { url, markdown: false, separateMarkdown: false }).parse()) as {
     content?: string;
     title?: string;
   };
+  await yieldToEventLoop();
   const md = turndown.turndown(result.content || html);
   return { markdown: md, title: result.title };
 }
@@ -211,15 +230,12 @@ async function summarizeWithQwen(
   const { signal, cancel } = withTimeout(parentSignal, QWEN_SUMMARIZE_TIMEOUT_MS);
   try {
     const tokenBudget = Math.min(Math.max(128, maxTokens), SUMMARY_MAX_TOKENS_HARD_CAP);
-    // Hint dans le prompt système : ~80% du budget pour laisser une marge au modèle
-    // de finir proprement sa dernière phrase. ~1.3 tokens/mot français.
-    const targetWords = Math.floor((tokenBudget * 0.8) / 1.3);
-    const sysPrompt = `Tu extrais ou résumes du contenu web pour un agent.
-Instruction: ${prompt}
-Tu reçois le markdown nettoyé d'une page.
-Retourne UNIQUEMENT ce qui répond à l'instruction. Markdown concis, citations entre guillemets.
-Si l'info n'est pas présente: "Non trouvé sur cette page."
-Vise environ ${targetWords} mots maximum (${tokenBudget} tokens budget).`;
+    // System prompt minimal + style caveman ultra → output ~40% plus compact.
+    // Code blocks/citations/identifiers verbatim (règle caveman). `prompt` user
+    // côté user message → stabilise préfixe pour prefix-cache SGLang.
+    const sysPrompt = `Extrais/résume le markdown selon instruction.
+Style ultra-terse: drop articles/filler/conjunctions, fragments OK, abbréviations DB/auth/config/req/res/fn, arrows X→Y. Code blocks, identifiers, error strings, URLs verbatim. Citations entre guillemets exactes. Si info absente: "Non trouvé".
+Budget ${tokenBudget} tokens.`;
 
     const res = await fetch(`${QWEN_BASE_URL}/chat/completions`, {
       signal,
@@ -229,10 +245,14 @@ Vise environ ${targetWords} mots maximum (${tokenBudget} tokens budget).`;
         model: QWEN_MODEL,
         messages: [
           { role: "system", content: sysPrompt },
-          { role: "user", content: markdown.slice(0, 100_000) },
+          { role: "user", content: `Instruction: ${prompt}\n\n---\n\n${markdown.slice(0, 100_000)}` },
         ],
         max_tokens: tokenBudget,
-        temperature: 0.3,
+        // Extraction factuelle → quasi déterministe, plus reproductible.
+        temperature: 0.1,
+        // Échantillonnage resserré : nucleus + top-k pour cohérence sur extraction.
+        top_p: 0.95,
+        top_k: 20,
         stream: false,
         // Désactive le thinking mode pour Qwen3 — résumer ne nécessite pas de
         // raisonnement et thinking volait tout le budget max_tokens (content=null).
@@ -312,12 +332,12 @@ export default function (pi: ExtensionAPI) {
     name: "web_search",
     label: "Web Search",
     description:
-      "Recherche web via SearXNG self-hosted (homelab). Étape de **discovery cheap** : retourne 5-10 résultats (titre + URL + snippet ~200 chars), sans charger le contenu des pages. Coût ~1s, ~1000 tokens output. Workflow typique : web_search d'abord pour trouver les URLs pertinentes, puis fetch_clean(url, prompt) pour zoomer sur le contenu utile.",
-    promptSnippet: "Discovery web : 5-10 résultats {titre, URL, snippet}. Cheap, à enchaîner avec fetch_clean.",
+      "SearXNG self-hosted. Discovery cheap → 5-10 résultats {titre+URL+snippet ~200 chars}, no page content. ~1s, ~1k tok output. Flow: web_search → fetch_clean(url, prompt) sur URLs pertinentes.",
+    promptSnippet: "Discovery web → {titre, URL, snippet}. Cheap. Chain with fetch_clean.",
     promptGuidelines: [
-      "Use web_search before fetch_clean when you don't already have an exact URL.",
-      "web_search returns only metadata (title/snippet/URL) — never full page content. Always pair with fetch_clean for actual content.",
-      "Pick at most 1-3 URLs from web_search results that look most relevant — don't fetch_clean all 8.",
+      "web_search before fetch_clean if no URL.",
+      "Returns metadata only (titre/URL/snippet), never page content → pair with fetch_clean.",
+      "Pick 1-3 URLs max, not all 8.",
     ],
     parameters: Type.Object({
       query: Type.String({ description: "Requête de recherche en langage naturel (ex: 'kubernetes operator best practices 2026')" }),
@@ -369,40 +389,40 @@ export default function (pi: ExtensionAPI) {
     name: "fetch_clean",
     label: "Fetch Clean",
     description:
-      "Récupère et nettoie le contenu d'une URL web. Toujours préférer ce tool à curl/wget. Pipeline : (1) HTTP direct + extraction defuddle (strip nav/sidebar/footer/ads) → markdown propre ; (2) si bloqué/JS-only, fallback Jina Reader self-hosted (rend la page côté serveur) ; (3) si `prompt` fourni, Qwen extrait/résume seulement la partie qui répond à ton instruction. **Pas de cache, chaque appel est frais.** Cas typique : `fetch_clean(url, prompt='quelle est la version actuelle ?')` → ~500 tokens au lieu de 50k de markdown brut.",
-    promptSnippet: "URL → markdown propre. Avec `prompt`, summarize/extract via Qwen (économise 10-100x les tokens).",
+      "Fetch URL → markdown propre. Préférer à curl/wget. Pipeline: (1) HTTP direct + defuddle strip nav/sidebar/footer/ads ; (2) fallback Jina self-hosted si bloqué/JS-only ; (3) `prompt` → Qwen extrait/résume. No cache, toujours frais. Typique: fetch_clean(url, prompt='version actuelle?') → ~500 tok vs 50k raw.",
+    promptSnippet: "URL → markdown clean. Avec `prompt` → Qwen summarize (10-100x moins tokens).",
     promptGuidelines: [
-      "Use fetch_clean instead of curl/wget for any web URL — strips noise (nav/ads/footer) and handles bot detection automatically via Jina fallback.",
-      "**Always pass a `prompt` when you have a specific question** — Qwen will summarize/extract only what matches, returning ~500-1500 tokens instead of 30k of raw markdown. Example: fetch_clean(url, prompt='donne le numéro de version actuel').",
-      "Skip `prompt` only when you genuinely need the full markdown of the page (rare — usually means you need raw, see below).",
-      "Set `raw: true` for verbatim content (extracting code snippets, citing exact phrases, debugging extraction). This skips Qwen even if `prompt` is given.",
-      "If a summary comes back marked `[TRUNCATED]` (finish_reason=length), re-call fetch_clean with a larger `summary_max_tokens` (default 1024, cap 8192). Typical bumps: 2048 for detailed lists, 4096 for multi-section synthesis.",
-      "Each fetch_clean call is fresh (no cache). Don't re-call with the same URL+prompt expecting different results.",
+      "fetch_clean > curl/wget. Strip noise + bot detection auto via Jina fallback.",
+      "**Pass `prompt` if question specific** → Qwen filtre, ~500-1500 tok vs 30k raw. Ex: prompt='version actuelle'.",
+      "Skip `prompt` seulement si markdown complet vraiment nécessaire (rare).",
+      "`raw: true` → verbatim (code snippets, citations exactes, debug extraction). Skip Qwen même avec `prompt`.",
+      "Si summary préfixé `[TRUNCATED]` (finish_reason=length) → re-call avec summary_max_tokens plus grand. Défaut 1024, cap 8192. Bumps: 2048 listes, 4096 multi-section.",
+      "No cache. Pas de re-call même URL+prompt en attendant résultat différent.",
     ],
     parameters: Type.Object({
-      url: Type.String({ description: "URL absolue à fetcher (http/https)" }),
+      url: Type.String({ description: "URL absolue (http/https)" }),
       prompt: Type.Optional(
         Type.String({
           description:
-            "Instruction d'extraction/résumé pour Qwen. Si fourni (et `raw` non activé), Qwen filtre la page pour ne garder que ce qui répond à ton instruction. Économise 10-100x les tokens vs raw markdown. Exemples : 'donne juste la version', 'résume en 3 bullets', 'liste les endpoints POST'.",
+            "Instruction extraction/résumé Qwen. Si fourni (et !raw), Qwen filtre page selon instruction. 10-100x moins tokens vs raw. Ex: 'donne version', 'résume 3 bullets', 'liste endpoints POST'.",
         }),
       ),
       raw: Type.Optional(
         Type.Boolean({
           description:
-            "Force le retour markdown brut, même si `prompt` est fourni. Utile pour : extraction code source littérale, citation exacte avec ponctuation/casse, debug d'extraction. Coûteux en tokens — n'utilise que si vraiment nécessaire.",
+            "Force markdown brut, skip Qwen même avec `prompt`. Pour: code source littéral, citation exacte ponctuation/casse, debug. Coûteux tokens — utiliser seulement si nécessaire.",
           default: false,
         }),
       ),
       summary_max_tokens: Type.Optional(
         Type.Number({
-          description: `Budget tokens du summary Qwen (défaut ${SUMMARY_MAX_TOKENS_DEFAULT}, cap ${SUMMARY_MAX_TOKENS_HARD_CAP}). Augmente si le summary précédent revient préfixé [TRUNCATED] (finish_reason=length).`,
+          description: `Budget tokens summary Qwen. Défaut ${SUMMARY_MAX_TOKENS_DEFAULT}, cap ${SUMMARY_MAX_TOKENS_HARD_CAP}. Augmente si [TRUNCATED] (finish_reason=length).`,
           default: SUMMARY_MAX_TOKENS_DEFAULT,
         }),
       ),
       max_chars: Type.Optional(
         Type.Number({
-          description: `Hard truncate du markdown brut (défaut ${HARD_TRUNCATE} chars). Sans effet sur le summary qui est toujours plus court.`,
+          description: `Hard truncate markdown brut. Défaut ${HARD_TRUNCATE}. Sans effet sur summary (toujours plus court).`,
           default: HARD_TRUNCATE,
         }),
       ),
