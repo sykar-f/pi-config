@@ -280,16 +280,36 @@ async function extractWithDefuddle(html: string, url: string): Promise<{ markdow
   return { markdown: md, title: result.title };
 }
 
-async function summarizeWithQwen(markdown: string, prompt: string, parentSignal: AbortSignal | undefined): Promise<string> {
+interface SummaryResult {
+  text: string;
+  truncatedByLength: boolean;
+  finishReason: string | null;
+}
+
+const SUMMARY_MAX_TOKENS_DEFAULT = 1024;
+// Cap dur pour éviter les abus / latence excessive. Au-delà, mieux vaut splitter
+// la page en plusieurs fetch_clean ciblés.
+const SUMMARY_MAX_TOKENS_HARD_CAP = 8192;
+
+async function summarizeWithQwen(
+  markdown: string,
+  prompt: string,
+  parentSignal: AbortSignal | undefined,
+  maxTokens: number = SUMMARY_MAX_TOKENS_DEFAULT,
+): Promise<SummaryResult> {
   const release = await qwenSem.acquire();
   const { signal, cancel } = withTimeout(parentSignal, QWEN_SUMMARIZE_TIMEOUT_MS);
   try {
+    const tokenBudget = Math.min(Math.max(128, maxTokens), SUMMARY_MAX_TOKENS_HARD_CAP);
+    // Le hint dans le prompt système vise ~80% du budget pour laisser une marge
+    // au modèle de finir proprement sa dernière phrase.
+    const targetWords = Math.floor((tokenBudget * 0.8) / 1.3); // ~1.3 tokens/mot français
     const sysPrompt = `Tu extrais ou résumes du contenu web pour un agent.
 Instruction: ${prompt}
 Tu reçois le markdown nettoyé d'une page.
 Retourne UNIQUEMENT ce qui répond à l'instruction. Markdown concis, citations entre guillemets.
 Si l'info n'est pas présente: "Non trouvé sur cette page."
-Maximum 800 tokens.`;
+Vise environ ${targetWords} mots maximum (${tokenBudget} tokens budget).`;
 
     const res = await fetch(`${QWEN_BASE_URL}/chat/completions`, {
       signal,
@@ -301,7 +321,7 @@ Maximum 800 tokens.`;
           { role: "system", content: sysPrompt },
           { role: "user", content: markdown.slice(0, 100_000) },
         ],
-        max_tokens: 1024,
+        max_tokens: tokenBudget,
         temperature: 0.3,
         stream: false,
         // Désactive le thinking mode pour Qwen3 — résumer ne nécessite pas de
@@ -311,12 +331,22 @@ Maximum 800 tokens.`;
     });
     if (!res.ok) throw new Error(`Qwen summarize HTTP ${res.status}`);
     const data = (await res.json()) as {
-      choices?: Array<{ message?: { content?: string | null; reasoning_content?: string | null } }>;
+      choices?: Array<{
+        message?: { content?: string | null; reasoning_content?: string | null };
+        finish_reason?: string | null;
+      }>;
     };
-    const msg = data.choices?.[0]?.message;
+    const choice = data.choices?.[0];
+    const msg = choice?.message;
     // Fallback ceinture+bretelles : si content null malgré chat_template_kwargs
     // (vieux serveurs SGLang, modèles non-Qwen3), on récupère reasoning_content.
-    return msg?.content || msg?.reasoning_content || "";
+    const text = msg?.content || msg?.reasoning_content || "";
+    const finishReason = choice?.finish_reason ?? null;
+    return {
+      text,
+      truncatedByLength: finishReason === "length",
+      finishReason,
+    };
   } finally {
     cancel();
     release();
@@ -437,6 +467,7 @@ export default function (pi: ExtensionAPI) {
       "Pass a `prompt` to fetch_clean whenever possible: it summarizes via Qwen and saves tokens.",
       "fetch_clean caches results 24h — re-calling the same URL is cheap.",
       "Set `raw: true` when you need verbatim content (code extraction, exact citations, debugging) — skips the Qwen summary even if `prompt` is given.",
+      "If a summary comes back marked [TRUNCATED] (finish_reason=length), re-call with a larger `summary_max_tokens` (default 1024, hard cap 8192).",
     ],
     parameters: Type.Object({
       url: Type.String({ description: "URL absolue à fetcher (http/https)" }),
@@ -450,6 +481,12 @@ export default function (pi: ExtensionAPI) {
           description:
             "Force le retour du markdown brut, même si `prompt` est fourni. Utile pour extraction littérale (code, citations exactes, debugging).",
           default: false,
+        }),
+      ),
+      summary_max_tokens: Type.Optional(
+        Type.Number({
+          description: `Budget tokens du summary Qwen (défaut ${SUMMARY_MAX_TOKENS_DEFAULT}, cap dur ${SUMMARY_MAX_TOKENS_HARD_CAP}). Augmente si le summary précédent est tronqué (finish_reason=length).`,
+          default: SUMMARY_MAX_TOKENS_DEFAULT,
         }),
       ),
       max_chars: Type.Optional(
@@ -497,14 +534,22 @@ export default function (pi: ExtensionAPI) {
 
         let content = routed.markdown;
         let summarized = false;
+        let summaryTruncatedByLength = false;
+        let summaryFinishReason: string | null = null;
+        const summaryBudget = Math.min(
+          Math.max(128, params.summary_max_tokens ?? SUMMARY_MAX_TOKENS_DEFAULT),
+          SUMMARY_MAX_TOKENS_HARD_CAP,
+        );
 
         // 3. Summarize via Qwen si prompt fourni
         if (promptText && content.length > 500) {
           try {
-            const summary = await summarizeWithQwen(content, promptText, signal);
-            if (summary && summary.trim().length > 0) {
-              content = summary;
+            const summary = await summarizeWithQwen(content, promptText, signal, summaryBudget);
+            if (summary.text && summary.text.trim().length > 0) {
+              content = summary.text;
               summarized = true;
+              summaryTruncatedByLength = summary.truncatedByLength;
+              summaryFinishReason = summary.finishReason;
             }
           } catch (e) {
             const msg = e instanceof Error ? e.message : String(e);
@@ -523,13 +568,29 @@ export default function (pi: ExtensionAPI) {
         };
         writeCache(url, routed.markdown, meta);
 
-        // 5. Hard truncate output
-        const truncated = content.length > max_chars;
-        const finalText = truncated
-          ? content.slice(0, max_chars) + `\n\n[truncated at ${max_chars} chars. use get_stored_content for more]`
-          : content;
+        // 5. Préfixe explicite si le summary a été coupé par la limite de tokens
+        // → le LLM parent peut décider de re-appeler avec summary_max_tokens plus élevé.
+        let displayContent = content;
+        if (summaryTruncatedByLength) {
+          displayContent =
+            `[TRUNCATED — summary atteint summary_max_tokens=${summaryBudget}, finish_reason=length. ` +
+            `Re-appelle fetch_clean avec summary_max_tokens plus élevé (cap ${SUMMARY_MAX_TOKENS_HARD_CAP}) si tu as besoin de plus.]\n\n` +
+            content;
+        }
 
-        return safeResult(`# ${routed.title || url}\n\n${finalText}`, { ...meta, truncated });
+        // 6. Hard truncate output
+        const truncated = displayContent.length > max_chars;
+        const finalText = truncated
+          ? displayContent.slice(0, max_chars) + `\n\n[truncated at ${max_chars} chars. use get_stored_content for more]`
+          : displayContent;
+
+        return safeResult(`# ${routed.title || url}\n\n${finalText}`, {
+          ...meta,
+          truncated,
+          summary_max_tokens: summarized ? summaryBudget : undefined,
+          summary_truncated_by_length: summarized ? summaryTruncatedByLength : undefined,
+          summary_finish_reason: summarized ? summaryFinishReason : undefined,
+        });
       } catch (e) {
         // Fallback ultime — ne jamais throw au runtime Pi
         const msg = e instanceof Error ? e.message : String(e);
