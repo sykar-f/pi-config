@@ -25,15 +25,18 @@ import { JSDOM } from "jsdom";
 import TurndownService from "turndown";
 import { Agent, setGlobalDispatcher } from "undici";
 
-// Pool HTTP keep-alive partagé : évite les handshakes TLS répétés sur fetches
-// parallèles vers le même domaine (Wikipedia, GitHub, etc.). Gain ~150-300ms
-// par fetch après le premier sur un même host.
+// Pool HTTP keep-alive partagé. Tente HTTP/2 via ALPN (allowH2: true) :
+// si le serveur supporte → 1 TCP + multiplexing streams + HPACK header compression,
+// fallback HTTP/1.1 keep-alive sinon. HTTP/3/QUIC pas encore mature côté client
+// Node (node:quic expérimental Node v24+, pas exposé via undici fetch). Pattern
+// recommandé pour notre workload : keep-alive HTTP/1.1 → HTTP/2 → ignorer H3.
 setGlobalDispatcher(
   new Agent({
     keepAliveTimeout: 30_000,
     keepAliveMaxTimeout: 60_000,
-    connections: 32, // pool large : permet jusqu'à 32 connexions simultanées
+    connections: 32,
     pipelining: 1,
+    allowH2: true,
   }),
 );
 
