@@ -5,8 +5,14 @@
 //   - fetch_clean      : fetch URL + defuddle extraction + Jina fallback + summary Qwen optionnel
 //   - get_stored_content : retrouve un fetch précédent depuis le cache (par url ou last)
 //
+// Garanties de robustesse :
+//   - chaque execute() est wrappé dans un try/catch global → jamais de throw au runtime Pi
+//   - safeResult() garantit la shape { content: [...], details } attendue par Pi
+//   - sémaphore Qwen (3 concurrent max) → évite saturation SGLang sous fetch parallèles
+//   - timeout par phase (fetch direct, Jina, summarize)
+//   - validation params défensive (URL parsable, types corrects)
+//
 // Cache disque : ~/.pi/cache/web/<sha1(url)>.md (TTL 24h, LRU 500MB)
-// Aucun appel à un LLM externe : tous les summaries passent par le Qwen homelab.
 
 import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
@@ -23,8 +29,8 @@ import TurndownService from "turndown";
 // ─────────────────────────────────────────────────────────────────────────────
 
 const CACHE_DIR = process.env.PI_FETCH_CACHE_DIR || join(homedir(), ".pi", "cache", "web");
-const CACHE_TTL_MS = 24 * 60 * 60 * 1000; // 24h
-const CACHE_MAX_BYTES = 500 * 1024 * 1024; // 500MB
+const CACHE_TTL_MS = 24 * 60 * 60 * 1000;
+const CACHE_MAX_BYTES = 500 * 1024 * 1024;
 const HARD_TRUNCATE = 30_000;
 
 const SEARXNG_URL = process.env.PI_SEARXNG_URL || "http://docker:8888";
@@ -32,15 +38,100 @@ const JINA_READER_URL = process.env.PI_JINA_READER_URL || "http://docker:3000";
 const QWEN_BASE_URL = process.env.PI_QWEN_BASE_URL || "http://docker:8000/v1";
 const QWEN_MODEL = process.env.PI_QWEN_MODEL || "Qwen/Qwen3.6-35B-A3B-FP8";
 
+const FETCH_DIRECT_TIMEOUT_MS = 15_000;
+const FETCH_JINA_TIMEOUT_MS = 45_000;
+const QWEN_SUMMARIZE_TIMEOUT_MS = 60_000;
+const SEARXNG_TIMEOUT_MS = 15_000;
+// Au-delà de 3 summaries Qwen en parallèle, le throughput SGLang dégrade fortement
+// pour notre setup (2× RTX 4090, batch limité). Sémaphore défensif.
+const QWEN_MAX_CONCURRENT = 3;
+
 const UA =
   "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36";
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Helpers shape Pi tool result — JAMAIS retourner content undefined
+// ─────────────────────────────────────────────────────────────────────────────
+
+type ToolResult = {
+  content: Array<{ type: "text"; text: string }>;
+  details?: Record<string, unknown>;
+  isError?: boolean;
+};
+
+function safeResult(text: string, details: Record<string, unknown> = {}, isError = false): ToolResult {
+  // Pi attend strictement un tableau content non-vide. Coerce text en string.
+  const safeText = typeof text === "string" && text.length > 0 ? text : "[empty result]";
+  return {
+    content: [{ type: "text", text: safeText }],
+    details,
+    isError,
+  };
+}
+
+function errorResult(msg: string, details: Record<string, unknown> = {}): ToolResult {
+  return safeResult(msg, { ...details, error: true }, true);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Sémaphore concurrence Qwen
+// ─────────────────────────────────────────────────────────────────────────────
+
+class Semaphore {
+  private active = 0;
+  private queue: Array<() => void> = [];
+  constructor(private readonly max: number) {}
+
+  async acquire(): Promise<() => void> {
+    if (this.active < this.max) {
+      this.active++;
+      return () => this.release();
+    }
+    await new Promise<void>((resolve) => this.queue.push(resolve));
+    this.active++;
+    return () => this.release();
+  }
+
+  private release() {
+    this.active--;
+    const next = this.queue.shift();
+    if (next) next();
+  }
+}
+
+const qwenSem = new Semaphore(QWEN_MAX_CONCURRENT);
+
+// ─────────────────────────────────────────────────────────────────────────────
+// AbortSignal helpers — combine externe + timeout interne
+// ─────────────────────────────────────────────────────────────────────────────
+
+function withTimeout(parent: AbortSignal | undefined, ms: number): { signal: AbortSignal; cancel: () => void } {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(new Error(`timeout ${ms}ms`)), ms);
+  const onParentAbort = () => ctrl.abort(parent?.reason);
+  if (parent) {
+    if (parent.aborted) ctrl.abort(parent.reason);
+    else parent.addEventListener("abort", onParentAbort, { once: true });
+  }
+  return {
+    signal: ctrl.signal,
+    cancel: () => {
+      clearTimeout(timer);
+      if (parent) parent.removeEventListener("abort", onParentAbort);
+    },
+  };
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Cache helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
 function ensureCacheDir(): void {
-  if (!existsSync(CACHE_DIR)) mkdirSync(CACHE_DIR, { recursive: true });
+  try {
+    if (!existsSync(CACHE_DIR)) mkdirSync(CACHE_DIR, { recursive: true });
+  } catch {
+    // ignore — cache best-effort
+  }
 }
 
 function urlKey(url: string): string {
@@ -69,18 +160,22 @@ interface CacheMeta {
 }
 
 function writeCache(url: string, content: string, meta: CacheMeta): void {
-  ensureCacheDir();
-  writeFileSync(cachePath(url), content);
-  writeFileSync(metaPath(url), JSON.stringify(meta, null, 2));
-  writeFileSync(lastPath(), JSON.stringify({ url }));
-  evictLRU();
+  try {
+    ensureCacheDir();
+    writeFileSync(cachePath(url), content);
+    writeFileSync(metaPath(url), JSON.stringify(meta, null, 2));
+    writeFileSync(lastPath(), JSON.stringify({ url }));
+    evictLRU();
+  } catch {
+    // cache write failure ne doit pas bloquer le tool
+  }
 }
 
 function readCache(url: string): { content: string; meta: CacheMeta } | null {
-  const cp = cachePath(url);
-  const mp = metaPath(url);
-  if (!existsSync(cp) || !existsSync(mp)) return null;
   try {
+    const cp = cachePath(url);
+    const mp = metaPath(url);
+    if (!existsSync(cp) || !existsSync(mp)) return null;
     const meta = JSON.parse(readFileSync(mp, "utf8")) as CacheMeta;
     if (Date.now() - meta.fetched_at > CACHE_TTL_MS) return null;
     const content = readFileSync(cp, "utf8");
@@ -99,7 +194,7 @@ function evictLRU(): void {
         const s = statSync(fp);
         return { fp, mtime: s.mtimeMs, size: s.size };
       })
-      .sort((a, b) => a.mtime - b.mtime); // older first
+      .sort((a, b) => a.mtime - b.mtime);
     let total = entries.reduce((s, e) => s + e.size, 0);
     for (const e of entries) {
       if (total <= CACHE_MAX_BYTES) break;
@@ -118,34 +213,58 @@ function evictLRU(): void {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Validation
+// ─────────────────────────────────────────────────────────────────────────────
+
+function isValidUrl(s: unknown): s is string {
+  if (typeof s !== "string" || s.length === 0) return false;
+  try {
+    const u = new URL(s);
+    return u.protocol === "http:" || u.protocol === "https:";
+  } catch {
+    return false;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Fetch primitives
 // ─────────────────────────────────────────────────────────────────────────────
 
-async function fetchDirect(url: string, signal: AbortSignal): Promise<string> {
-  const res = await fetch(url, {
-    signal,
-    redirect: "follow",
-    headers: {
-      "User-Agent": UA,
-      Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-      "Accept-Language": "fr-FR,fr;q=0.9,en;q=0.8",
-      "Sec-Fetch-Dest": "document",
-      "Sec-Fetch-Mode": "navigate",
-      "Sec-Fetch-Site": "none",
-      "Upgrade-Insecure-Requests": "1",
-    },
-  });
-  if (!res.ok) throw new Error(`HTTP ${res.status} ${res.statusText}`);
-  return res.text();
+async function fetchDirect(url: string, parentSignal: AbortSignal | undefined): Promise<string> {
+  const { signal, cancel } = withTimeout(parentSignal, FETCH_DIRECT_TIMEOUT_MS);
+  try {
+    const res = await fetch(url, {
+      signal,
+      redirect: "follow",
+      headers: {
+        "User-Agent": UA,
+        Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "fr-FR,fr;q=0.9,en;q=0.8",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "none",
+        "Upgrade-Insecure-Requests": "1",
+      },
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status} ${res.statusText}`);
+    return await res.text();
+  } finally {
+    cancel();
+  }
 }
 
-async function fetchViaJina(url: string, signal: AbortSignal): Promise<string> {
-  const res = await fetch(`${JINA_READER_URL}/${url}`, {
-    signal,
-    headers: { "X-Respond-With": "markdown", Accept: "text/markdown" },
-  });
-  if (!res.ok) throw new Error(`Jina HTTP ${res.status}`);
-  return res.text();
+async function fetchViaJina(url: string, parentSignal: AbortSignal | undefined): Promise<string> {
+  const { signal, cancel } = withTimeout(parentSignal, FETCH_JINA_TIMEOUT_MS);
+  try {
+    const res = await fetch(`${JINA_READER_URL}/${url}`, {
+      signal,
+      headers: { "X-Respond-With": "markdown", Accept: "text/markdown" },
+    });
+    if (!res.ok) throw new Error(`Jina HTTP ${res.status}`);
+    return await res.text();
+  } finally {
+    cancel();
+  }
 }
 
 const turndown = new TurndownService({ headingStyle: "atx", codeBlockStyle: "fenced", bulletListMarker: "-" });
@@ -161,32 +280,39 @@ async function extractWithDefuddle(html: string, url: string): Promise<{ markdow
   return { markdown: md, title: result.title };
 }
 
-async function summarizeWithQwen(markdown: string, prompt: string, signal: AbortSignal): Promise<string> {
-  const sysPrompt = `Tu extrais ou résumes du contenu web pour un agent.
+async function summarizeWithQwen(markdown: string, prompt: string, parentSignal: AbortSignal | undefined): Promise<string> {
+  const release = await qwenSem.acquire();
+  const { signal, cancel } = withTimeout(parentSignal, QWEN_SUMMARIZE_TIMEOUT_MS);
+  try {
+    const sysPrompt = `Tu extrais ou résumes du contenu web pour un agent.
 Instruction: ${prompt}
 Tu reçois le markdown nettoyé d'une page.
 Retourne UNIQUEMENT ce qui répond à l'instruction. Markdown concis, citations entre guillemets.
 Si l'info n'est pas présente: "Non trouvé sur cette page."
 Maximum 800 tokens.`;
 
-  const res = await fetch(`${QWEN_BASE_URL}/chat/completions`, {
-    signal,
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      model: QWEN_MODEL,
-      messages: [
-        { role: "system", content: sysPrompt },
-        { role: "user", content: markdown.slice(0, 100_000) },
-      ],
-      max_tokens: 1024,
-      temperature: 0.3,
-      stream: false,
-    }),
-  });
-  if (!res.ok) throw new Error(`Qwen summarize HTTP ${res.status}`);
-  const data = (await res.json()) as { choices?: Array<{ message?: { content?: string } }> };
-  return data.choices?.[0]?.message?.content || "";
+    const res = await fetch(`${QWEN_BASE_URL}/chat/completions`, {
+      signal,
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: QWEN_MODEL,
+        messages: [
+          { role: "system", content: sysPrompt },
+          { role: "user", content: markdown.slice(0, 100_000) },
+        ],
+        max_tokens: 1024,
+        temperature: 0.3,
+        stream: false,
+      }),
+    });
+    if (!res.ok) throw new Error(`Qwen summarize HTTP ${res.status}`);
+    const data = (await res.json()) as { choices?: Array<{ message?: { content?: string } }> };
+    return data.choices?.[0]?.message?.content || "";
+  } finally {
+    cancel();
+    release();
+  }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -199,8 +325,9 @@ interface RoutedFetch {
   source: "direct" | "jina";
 }
 
-async function routedFetch(url: string, signal: AbortSignal): Promise<RoutedFetch> {
+async function routedFetch(url: string, signal: AbortSignal | undefined): Promise<RoutedFetch> {
   // Tente direct + defuddle
+  let directErr: Error | null = null;
   try {
     const html = await fetchDirect(url, signal);
     if (html && html.length > 200) {
@@ -209,13 +336,22 @@ async function routedFetch(url: string, signal: AbortSignal): Promise<RoutedFetc
         return { ...ext, source: "direct" };
       }
     }
-  } catch {
-    // fallthrough vers Jina
+  } catch (e) {
+    directErr = e instanceof Error ? e : new Error(String(e));
   }
   // Fallback Jina Reader (rend JS, contourne anti-bot, retourne markdown clean)
-  const md = await fetchViaJina(url, signal);
-  const titleMatch = md.match(/^Title:\s*(.+)$/m) || md.match(/^#\s+(.+)$/m);
-  return { markdown: md, title: titleMatch?.[1]?.trim(), source: "jina" };
+  try {
+    const md = await fetchViaJina(url, signal);
+    if (!md || md.length < 50) {
+      throw new Error("Jina returned empty/short content");
+    }
+    const titleMatch = md.match(/^Title:\s*(.+)$/m) || md.match(/^#\s+(.+)$/m);
+    return { markdown: md, title: titleMatch?.[1]?.trim(), source: "jina" };
+  } catch (jinaErr) {
+    const dMsg = directErr?.message || "no content";
+    const jMsg = jinaErr instanceof Error ? jinaErr.message : String(jinaErr);
+    throw new Error(`fetch failed (direct: ${dMsg}; jina: ${jMsg})`);
+  }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -234,40 +370,50 @@ export default function (pi: ExtensionAPI) {
     promptSnippet: "Recherche web via SearXNG → titres, snippets, URLs.",
     promptGuidelines: [
       "Use web_search before fetch_clean when you don't already have a URL.",
-      "web_search returns only metadata (titre/snippet/URL) — no full page content.",
+      "web_search returns only metadata (title/snippet/URL) — no full page content.",
     ],
     parameters: Type.Object({
       query: Type.String({ description: "Requête de recherche" }),
       limit: Type.Optional(Type.Number({ description: "Nombre max de résultats (défaut 8)", default: 8 })),
     }),
-    async execute(_id, params, signal, _onUpdate, _ctx) {
-      const limit = params.limit ?? 8;
-      const u = new URL(`${SEARXNG_URL}/search`);
-      u.searchParams.set("q", params.query);
-      u.searchParams.set("format", "json");
-      u.searchParams.set("safesearch", "0");
-      const res = await fetch(u, { signal });
-      if (!res.ok) {
-        return {
-          content: [{ type: "text", text: `Erreur SearXNG: HTTP ${res.status}` }],
-          details: { error: true },
-        };
+    async execute(_id, params, signal, _onUpdate, _ctx): Promise<ToolResult> {
+      try {
+        if (typeof params?.query !== "string" || params.query.trim().length === 0) {
+          return errorResult("query manquant ou vide");
+        }
+        const limit = Math.min(Math.max(1, params.limit ?? 8), 20);
+        const u = new URL(`${SEARXNG_URL}/search`);
+        u.searchParams.set("q", params.query);
+        u.searchParams.set("format", "json");
+        u.searchParams.set("safesearch", "0");
+
+        const { signal: sig, cancel } = withTimeout(signal, SEARXNG_TIMEOUT_MS);
+        let res: Response;
+        try {
+          res = await fetch(u, { signal: sig });
+        } finally {
+          cancel();
+        }
+        if (!res.ok) return errorResult(`SearXNG HTTP ${res.status}`, { query: params.query });
+
+        const data = (await res.json()) as { results?: Array<{ url: string; title: string; content?: string; engine?: string }> };
+        const results = (data.results || []).slice(0, limit);
+        if (results.length === 0) {
+          return safeResult(`Aucun résultat pour "${params.query}".`, { query: params.query, count: 0 });
+        }
+        const text = results
+          .map(
+            (r, i) =>
+              `${i + 1}. **${r.title || "(sans titre)"}**\n   ${r.url}\n   ${(r.content || "").slice(0, 200)}${
+                r.engine ? `\n   _via ${r.engine}_` : ""
+              }`,
+          )
+          .join("\n\n");
+        return safeResult(text, { query: params.query, count: results.length });
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        return errorResult(`web_search exception: ${msg}`, { query: String(params?.query ?? "") });
       }
-      const data = (await res.json()) as { results?: Array<{ url: string; title: string; content?: string; engine?: string }> };
-      const results = (data.results || []).slice(0, limit);
-      const text =
-        results.length === 0
-          ? `Aucun résultat pour "${params.query}".`
-          : results
-              .map(
-                (r, i) =>
-                  `${i + 1}. **${r.title}**\n   ${r.url}\n   ${r.content?.slice(0, 200) || ""}${r.engine ? `\n   _via ${r.engine}_` : ""}`,
-              )
-              .join("\n\n");
-      return {
-        content: [{ type: "text", text }],
-        details: { query: params.query, count: results.length },
-      };
     },
   });
 
@@ -284,7 +430,7 @@ export default function (pi: ExtensionAPI) {
       "fetch_clean caches results 24h — re-calling the same URL is cheap.",
     ],
     parameters: Type.Object({
-      url: Type.String({ description: "URL absolue à fetcher" }),
+      url: Type.String({ description: "URL absolue à fetcher (http/https)" }),
       prompt: Type.Optional(
         Type.String({
           description: "Instruction d'extraction/résumé. Si fourni, Qwen filtre le contenu pour ne garder que ce qui matche.",
@@ -295,74 +441,95 @@ export default function (pi: ExtensionAPI) {
       ),
       no_cache: Type.Optional(Type.Boolean({ description: "Ignore le cache disque", default: false })),
     }),
-    async execute(_id, params, signal, onUpdate, _ctx) {
-      const max_chars = params.max_chars ?? HARD_TRUNCATE;
-
-      // 1. Cache hit ?
-      if (!params.no_cache && !params.prompt) {
-        const hit = readCache(params.url);
-        if (hit) {
-          onUpdate?.({ status: "cache-hit" });
-          const truncated = hit.content.length > max_chars;
-          const out = truncated ? hit.content.slice(0, max_chars) + `\n\n[truncated. use get_stored_content to read more]` : hit.content;
-          return {
-            content: [{ type: "text", text: out }],
-            details: { ...hit.meta, cached: true, truncated },
-          };
-        }
-      }
-
-      // 2. Fetch + extract
-      onUpdate?.({ status: "fetching" });
-      let routed: RoutedFetch;
+    async execute(_id, params, signal, onUpdate, _ctx): Promise<ToolResult> {
       try {
-        routed = await routedFetch(params.url, signal);
-      } catch (e) {
-        const msg = e instanceof Error ? e.message : String(e);
-        return {
-          content: [{ type: "text", text: `Échec fetch ${params.url}: ${msg}` }],
-          details: { error: true, url: params.url },
-        };
-      }
-
-      let content = routed.markdown;
-      let summarized = false;
-
-      // 3. Summarize via Qwen si prompt fourni
-      if (params.prompt && content.length > 500) {
-        onUpdate?.({ status: "summarizing" });
-        try {
-          const summary = await summarizeWithQwen(content, params.prompt, signal);
-          if (summary.trim()) {
-            content = summary;
-            summarized = true;
-          }
-        } catch (e) {
-          // continue avec markdown raw si summarize échoue
-          const msg = e instanceof Error ? e.message : String(e);
-          content = `[Qwen summarize failed: ${msg}]\n\n${content}`;
+        if (!isValidUrl(params?.url)) {
+          return errorResult(`URL invalide: ${String(params?.url)}`, { url: String(params?.url ?? "") });
         }
+        const url = params.url;
+        const max_chars = Math.max(500, params.max_chars ?? HARD_TRUNCATE);
+        const promptText = typeof params.prompt === "string" && params.prompt.trim().length > 0 ? params.prompt : undefined;
+
+        // 1. Cache hit (uniquement si pas de prompt — sinon il faudrait re-summarize)
+        if (!params.no_cache && !promptText) {
+          const hit = readCache(url);
+          if (hit) {
+            try {
+              onUpdate?.({ status: "cache-hit" });
+            } catch {
+              // ignore onUpdate errors
+            }
+            const truncated = hit.content.length > max_chars;
+            const out = truncated
+              ? hit.content.slice(0, max_chars) + `\n\n[truncated. use get_stored_content to read more]`
+              : hit.content;
+            return safeResult(`# ${hit.meta.title || url}\n\n${out}`, { ...hit.meta, cached: true, truncated });
+          }
+        }
+
+        // 2. Fetch + extract
+        try {
+          onUpdate?.({ status: "fetching" });
+        } catch {
+          // ignore
+        }
+        let routed: RoutedFetch;
+        try {
+          routed = await routedFetch(url, signal);
+        } catch (e) {
+          const msg = e instanceof Error ? e.message : String(e);
+          return errorResult(`Échec fetch ${url}: ${msg}`, { url });
+        }
+
+        if (!routed.markdown || routed.markdown.length === 0) {
+          return errorResult(`Contenu vide après extraction: ${url}`, { url, source: routed.source });
+        }
+
+        let content = routed.markdown;
+        let summarized = false;
+
+        // 3. Summarize via Qwen si prompt fourni
+        if (promptText && content.length > 500) {
+          try {
+            onUpdate?.({ status: "summarizing" });
+          } catch {
+            // ignore
+          }
+          try {
+            const summary = await summarizeWithQwen(content, promptText, signal);
+            if (summary && summary.trim().length > 0) {
+              content = summary;
+              summarized = true;
+            }
+          } catch (e) {
+            const msg = e instanceof Error ? e.message : String(e);
+            content = `[Qwen summarize failed: ${msg}]\n\n${content.slice(0, 5000)}`;
+          }
+        }
+
+        // 4. Stocke en cache (toujours le markdown brut, pas le summary)
+        const meta: CacheMeta = {
+          url,
+          title: routed.title,
+          fetched_at: Date.now(),
+          length: routed.markdown.length,
+          source: routed.source,
+          summarized,
+        };
+        writeCache(url, routed.markdown, meta);
+
+        // 5. Hard truncate output
+        const truncated = content.length > max_chars;
+        const finalText = truncated
+          ? content.slice(0, max_chars) + `\n\n[truncated at ${max_chars} chars. use get_stored_content for more]`
+          : content;
+
+        return safeResult(`# ${routed.title || url}\n\n${finalText}`, { ...meta, truncated });
+      } catch (e) {
+        // Fallback ultime — ne jamais throw au runtime Pi
+        const msg = e instanceof Error ? e.message : String(e);
+        return errorResult(`fetch_clean exception: ${msg}`, { url: String(params?.url ?? "") });
       }
-
-      // 4. Stocke en cache (toujours le markdown brut, pas le summary)
-      const meta: CacheMeta = {
-        url: params.url,
-        title: routed.title,
-        fetched_at: Date.now(),
-        length: routed.markdown.length,
-        source: routed.source,
-        summarized,
-      };
-      writeCache(params.url, routed.markdown, meta);
-
-      // 5. Hard truncate output
-      const truncated = content.length > max_chars;
-      const finalText = truncated ? content.slice(0, max_chars) + `\n\n[truncated at ${max_chars} chars. use get_stored_content for more]` : content;
-
-      return {
-        content: [{ type: "text", text: `# ${routed.title || params.url}\n\n${finalText}` }],
-        details: { ...meta, truncated },
-      };
     },
   });
 
@@ -384,45 +551,41 @@ export default function (pi: ExtensionAPI) {
       line_end: Type.Optional(Type.Number({ description: "Ligne de fin inclusive" })),
       max_chars: Type.Optional(Type.Number({ description: "Limite chars retournés", default: HARD_TRUNCATE })),
     }),
-    async execute(_id, params, _signal, _onUpdate, _ctx) {
-      let url = params.url;
-      if (!url && params.last) {
-        try {
-          const lp = lastPath();
-          if (existsSync(lp)) {
-            url = (JSON.parse(readFileSync(lp, "utf8")) as { url?: string }).url;
+    async execute(_id, params, _signal, _onUpdate, _ctx): Promise<ToolResult> {
+      try {
+        let url = typeof params?.url === "string" && params.url.length > 0 ? params.url : undefined;
+        if (!url && params?.last) {
+          try {
+            const lp = lastPath();
+            if (existsSync(lp)) {
+              url = (JSON.parse(readFileSync(lp, "utf8")) as { url?: string }).url;
+            }
+          } catch {
+            // ignore
           }
-        } catch {
-          // ignore
         }
+        if (!url) {
+          return errorResult("Aucune URL fournie et pas de fetch précédent.");
+        }
+        const hit = readCache(url);
+        if (!hit) {
+          return errorResult(`Pas de cache pour ${url}. Utilise fetch_clean d'abord.`, { url });
+        }
+        let content = hit.content;
+        if (params.line_start || params.line_end) {
+          const lines = content.split("\n");
+          const start = Math.max(0, (params.line_start ?? 1) - 1);
+          const end = params.line_end ? Math.min(lines.length, params.line_end) : lines.length;
+          content = lines.slice(start, end).join("\n");
+        }
+        const max_chars = Math.max(500, params.max_chars ?? HARD_TRUNCATE);
+        const truncated = content.length > max_chars;
+        const out = truncated ? content.slice(0, max_chars) + `\n\n[truncated at ${max_chars} chars]` : content;
+        return safeResult(out, { ...hit.meta, truncated, total_length: hit.content.length });
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        return errorResult(`get_stored_content exception: ${msg}`, { url: String(params?.url ?? "") });
       }
-      if (!url) {
-        return {
-          content: [{ type: "text", text: "Aucune URL fournie et pas de fetch précédent." }],
-          details: { error: true },
-        };
-      }
-      const hit = readCache(url);
-      if (!hit) {
-        return {
-          content: [{ type: "text", text: `Pas de cache pour ${url}. Utilise fetch_clean d'abord.` }],
-          details: { error: true, url },
-        };
-      }
-      let content = hit.content;
-      if (params.line_start || params.line_end) {
-        const lines = content.split("\n");
-        const start = Math.max(0, (params.line_start ?? 1) - 1);
-        const end = params.line_end ? Math.min(lines.length, params.line_end) : lines.length;
-        content = lines.slice(start, end).join("\n");
-      }
-      const max_chars = params.max_chars ?? HARD_TRUNCATE;
-      const truncated = content.length > max_chars;
-      const out = truncated ? content.slice(0, max_chars) + `\n\n[truncated at ${max_chars} chars]` : content;
-      return {
-        content: [{ type: "text", text: out }],
-        details: { ...hit.meta, truncated, total_length: hit.content.length },
-      };
     },
   });
 }
