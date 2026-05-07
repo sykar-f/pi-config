@@ -22,16 +22,23 @@ Configuration personnelle de [Pi](https://pi.dev/) — coding agent terminal —
 
 ```
 pi-config/
+├── config/
+│   ├── models.json            # providers (sglang-homelab, ollama)
+│   └── settings.json          # defaultProvider, defaultModel, thinkingLevel
 ├── extensions/
 │   ├── fetch-clean/           # 3 tools : web_search, fetch_clean, get_stored_content
 │   │   ├── index.ts
 │   │   └── package.json
+│   ├── rtk-bash/              # tool bash custom
+│   ├── caveman-prompt/        # extension caveman
 │   └── _packages/             # node_modules pour packages npm tiers (pi-subagents)
 ├── agents/
 │   └── deep-researcher.md     # subagent recherche web isolé
 └── scripts/
     └── install.sh             # provisionne les symlinks dans ~/.pi/agent/
 ```
+
+Tout `~/.pi/agent/` est composé de symlinks vers ce repo, sauf `auth.json` (secret, jamais committé).
 
 ## Installation sur une nouvelle machine
 
@@ -46,36 +53,17 @@ Le script :
 2. Installe les packages tiers (`pi-subagents`) dans `extensions/_packages/`
 3. Crée les symlinks `~/.pi/agent/extensions/{fetch-clean,pi-subagents}` et `~/.pi/agent/agents/deep-researcher.md`
 
-## Configuration provider Qwen
+## Configuration providers
 
-Dans `~/.pi/agent/models.json` :
+Définie dans `config/models.json` (versionnée), symlinkée vers `~/.pi/agent/models.json` par `install.sh`.
 
-```json
-{
-  "providers": {
-    "sglang-homelab": {
-      "baseUrl": "http://docker:8000/v1",
-      "api": "openai-completions",
-      "apiKey": "EMPTY",
-      "models": [
-        {
-          "id": "Qwen/Qwen3.6-35B-A3B-FP8",
-          "name": "Qwen3.6 35B-A3B (homelab)",
-          "reasoning": true,
-          "input": ["text", "image"],
-          "contextWindow": 65536,
-          "maxTokens": 8192,
-          "compat": {
-            "supportsDeveloperRole": false,
-            "supportsReasoningEffort": false,
-            "maxTokensField": "max_tokens"
-          }
-        }
-      ]
-    }
-  }
-}
-```
+Providers actuels :
+- **sglang-homelab** — Qwen3.6 35B-A3B FP8 sur SGLang (homelab Proxmox), ctx 65k
+- **ollama** — Gemma 4 26B-A4B + E4B sur Mac local (`localhost:11434`), ctx 32k
+
+Pour ajouter/modifier un modèle : édite `config/models.json` puis `pi` recharge automatiquement.
+
+`config/settings.json` définit le provider/modèle par défaut.
 
 ## Tools exposés
 

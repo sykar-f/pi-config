@@ -1,0 +1,73 @@
+{
+  "providers": {
+    "sglang-homelab": {
+      "baseUrl": "http://docker:8000/v1",
+      "api": "openai-completions",
+      "apiKey": "EMPTY",
+      "models": [
+        {
+          "id": "Qwen/Qwen3.6-35B-A3B-FP8",
+          "name": "Qwen3.6 35B-A3B (homelab)",
+          "reasoning": true,
+          "input": ["text", "image"],
+          "contextWindow": 65536,
+          "maxTokens": 8192,
+          "compat": {
+            "supportsDeveloperRole": false,
+            "supportsReasoningEffort": false,
+            "maxTokensField": "max_tokens"
+          },
+          "cost": {
+            "input": 0,
+            "output": 0,
+            "cacheRead": 0,
+            "cacheWrite": 0
+          }
+        }
+      ]
+    },
+    "ollama": {
+      "baseUrl": "http://localhost:11434/v1",
+      "api": "openai-completions",
+      "apiKey": "ollama",
+      "models": [
+        {
+          "id": "gemma4:26b-a4b-it-q4_K_M",
+          "name": "Gemma 4 26B-A4B (local)",
+          "input": ["text", "image"],
+          "contextWindow": 32768,
+          "maxTokens": 8192,
+          "compat": {
+            "supportsDeveloperRole": false,
+            "supportsReasoningEffort": false,
+            "maxTokensField": "max_tokens"
+          },
+          "cost": {
+            "input": 0,
+            "output": 0,
+            "cacheRead": 0,
+            "cacheWrite": 0
+          }
+        },
+        {
+          "id": "gemma4:e4b",
+          "name": "Gemma 4 E4B (local, fast)",
+          "input": ["text", "image"],
+          "contextWindow": 32768,
+          "maxTokens": 8192,
+          "compat": {
+            "supportsDeveloperRole": false,
+            "supportsReasoningEffort": false,
+            "maxTokensField": "max_tokens"
+          },
+          "cost": {
+            "input": 0,
+            "output": 0,
+            "cacheRead": 0,
+            "cacheWrite": 0
+          }
+        }
+      ]
+    }
+  }
+}

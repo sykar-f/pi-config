@@ -12,6 +12,13 @@ echo "==> Cible : $PI_HOME"
 
 mkdir -p "$PI_HOME/extensions" "$PI_HOME/agents"
 
+# 0. Symlinks fichiers de config (models, settings) — versionnés dans le repo
+echo "==> symlink config/models.json"
+ln -sfn "$REPO_DIR/config/models.json" "$PI_HOME/models.json"
+
+echo "==> symlink config/settings.json"
+ln -sfn "$REPO_DIR/config/settings.json" "$PI_HOME/settings.json"
+
 # 1. npm deps de fetch-clean
 echo "==> npm install (fetch-clean)"
 cd "$REPO_DIR/extensions/fetch-clean"
@@ -28,6 +35,9 @@ ln -sfn "$REPO_DIR/extensions/fetch-clean" "$PI_HOME/extensions/fetch-clean"
 
 echo "==> symlink rtk-bash"
 ln -sfn "$REPO_DIR/extensions/rtk-bash" "$PI_HOME/extensions/rtk-bash"
+
+echo "==> symlink caveman-prompt"
+ln -sfn "$REPO_DIR/extensions/caveman-prompt" "$PI_HOME/extensions/caveman-prompt"
 
 echo "==> symlink pi-subagents (vers le sous-répertoire src/ du package npm)"
 ln -sfn "$REPO_DIR/extensions/_packages/node_modules/@tintinweb/pi-subagents/src" "$PI_HOME/extensions/pi-subagents"
