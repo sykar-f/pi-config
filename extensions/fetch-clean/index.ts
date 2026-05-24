@@ -20,6 +20,10 @@
 
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { Type } from "typebox";
+// `Defuddle` exporté par defuddle/node est une fonction async
+// (signature: Defuddle(input, url?, options?) → Promise<DefuddleResponse>),
+// PAS un constructeur. Faire `new Defuddle(...)` throw "is not a constructor".
+// La classe est exportée sous le nom DefuddleClass — on ne l'utilise pas ici.
 import { Defuddle } from "defuddle/node";
 import { JSDOM, VirtualConsole } from "jsdom";
 import TurndownService from "turndown";
@@ -210,6 +214,28 @@ const yieldToEventLoop = () => new Promise<void>((resolve) => setImmediate(resol
 const muteConsole = new VirtualConsole();
 muteConsole.on("jsdomError", () => {});
 
+// Defuddle log ses propres erreurs internes (sélecteurs `:has()`/`:not()` que
+// nwsapi ne sait pas compiler) via console.error global — la VirtualConsole
+// JSDOM ne les capte PAS (source = Defuddle, pas jsdom). Ces erreurs sont
+// caught en interne par Defuddle (le content est quand même retourné), donc
+// pur bruit (~45 lignes/page) qui flooderait le terminal Pi à chaque fetch
+// direct. On installe UNE fois au load un filtre qui drop seulement ces lignes
+// et laisse passer le reste — concurrency-safe (pas de mutation per-call qui
+// risquerait d'avaler le stderr d'un fetch parallèle).
+// Defuddle émet: console.error('Defuddle', 'Error processing document:', err)
+// → 3 args, le tag 'Defuddle' en premier. On drop ces lignes-là uniquement.
+const origConsoleError = console.error.bind(console);
+console.error = (...args: unknown[]) => {
+  if (
+    args[0] === "Defuddle" &&
+    typeof args[1] === "string" &&
+    args[1].startsWith("Error processing document")
+  ) {
+    return;
+  }
+  origConsoleError(...args);
+};
+
 async function extractWithDefuddle(html: string, url: string): Promise<{ markdown: string; title?: string }> {
   // Options pinées lean : pas d'exec de scripts (défaut, mais explicite),
   // pas de layout/visuel simulé → moins de CPU par page sous fetches parallèles.
@@ -221,7 +247,10 @@ async function extractWithDefuddle(html: string, url: string): Promise<{ markdow
   });
   try {
     await yieldToEventLoop();
-    const result = (await new Defuddle(dom, { url, markdown: false, separateMarkdown: false }).parse()) as {
+    // Defuddle(input, url, options) — fonction async. On passe l'instance JSDOM
+    // (elle en extrait window.document) + url + options. markdown:false → result.content
+    // reste du HTML, qu'on convertit nous-mêmes via turndown en aval.
+    const result = (await Defuddle(dom, url, { markdown: false, separateMarkdown: false })) as {
       content?: string;
       title?: string;
     };
