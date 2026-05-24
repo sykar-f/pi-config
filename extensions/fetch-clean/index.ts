@@ -21,7 +21,7 @@
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { Type } from "typebox";
 import { Defuddle } from "defuddle/node";
-import { JSDOM } from "jsdom";
+import { JSDOM, VirtualConsole } from "jsdom";
 import TurndownService from "turndown";
 import { Agent, setGlobalDispatcher } from "undici";
 
@@ -201,16 +201,38 @@ turndown.remove(["script", "style", "noscript", "iframe"]);
 // pendant que JSDOM/Defuddle/turndown (synchrones, CPU-bound) traitent un gros HTML.
 const yieldToEventLoop = () => new Promise<void>((resolve) => setImmediate(resolve));
 
+// VirtualConsole partagée, muette. JSDOM forwarde par défaut `jsdomError`
+// (CSS imparsable par rrweb-cssom : nesting `&`, container queries, @layer…
+// et erreurs JS de pages qu'on ne va de toute façon pas exécuter) vers
+// console.error → flood le terminal Pi en plein fetch. On ne réémet PAS :
+// le contenu CSS/JS est strippé en aval (defuddle + turndown.remove), donc
+// ces erreurs sont du bruit pur sans impact sur l'extraction.
+const muteConsole = new VirtualConsole();
+muteConsole.on("jsdomError", () => {});
+
 async function extractWithDefuddle(html: string, url: string): Promise<{ markdown: string; title?: string }> {
-  const dom = new JSDOM(html, { url });
-  await yieldToEventLoop();
-  const result = (await new Defuddle(dom, { url, markdown: false, separateMarkdown: false }).parse()) as {
-    content?: string;
-    title?: string;
-  };
-  await yieldToEventLoop();
-  const md = turndown.turndown(result.content || html);
-  return { markdown: md, title: result.title };
+  // Options pinées lean : pas d'exec de scripts (défaut, mais explicite),
+  // pas de layout/visuel simulé → moins de CPU par page sous fetches parallèles.
+  const dom = new JSDOM(html, {
+    url,
+    virtualConsole: muteConsole,
+    runScripts: undefined,
+    pretendToBeVisual: false,
+  });
+  try {
+    await yieldToEventLoop();
+    const result = (await new Defuddle(dom, { url, markdown: false, separateMarkdown: false }).parse()) as {
+      content?: string;
+      title?: string;
+    };
+    await yieldToEventLoop();
+    const md = turndown.turndown(result.content || html);
+    return { markdown: md, title: result.title };
+  } finally {
+    // Libère la window JSDOM → évite l'accumulation mémoire sur fetches
+    // parallèles répétés (gros HTML). close() est idempotent et safe.
+    dom.window.close();
+  }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
